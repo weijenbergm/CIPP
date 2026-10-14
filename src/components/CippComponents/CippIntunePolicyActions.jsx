@@ -1,12 +1,4 @@
-import { Book, LaptopChromebook } from '@mui/icons-material'
-import {
-  DocumentDuplicateIcon,
-  GlobeAltIcon,
-  PencilIcon,
-  TrashIcon,
-  UserIcon,
-  UserGroupIcon,
-} from '@heroicons/react/24/outline'
+import { CippIcons } from '../../utils/icon-registry'
 
 const assignmentModeOptions = [
   { label: 'Replace existing assignments', value: 'replace' },
@@ -17,6 +9,72 @@ const assignmentFilterTypeOptions = [
   { label: 'Include - Apply policy to devices matching filter', value: 'include' },
   { label: 'Exclude - Apply policy to devices NOT matching filter', value: 'exclude' },
 ]
+
+const assignmentDirectionOptions = [
+  { label: 'Include these group(s)', value: 'include' },
+  { label: 'Exclude these group(s)', value: 'exclude' },
+]
+
+// Group picker (by ID) for one tenant. Shared by the assign row actions below and by the
+// policy/app deploy drawers, which pass the drawer's selected tenant so the list is not the
+// page tenant. Same queryKey as the row actions so the two share one cache per tenant.
+export const getGroupPickerField = (tenant, name, label, required) => ({
+  type: 'autoComplete',
+  name,
+  label,
+  multiple: true,
+  creatable: false,
+  allowResubmit: true,
+  ...(required && { validators: { required: 'Please select at least one group' } }),
+  api: {
+    url: '/api/ListGraphRequest',
+    dataKey: 'Results',
+    tenantFilter: tenant,
+    queryKey: `ListPolicyAssignmentGroups-${tenant}`,
+    labelField: (group) => (group.id ? `${group.displayName} (${group.id})` : group.displayName),
+    valueField: 'id',
+    addedField: {
+      description: 'description',
+      displayName: 'displayName',
+    },
+    data: {
+      Endpoint: 'groups',
+      manualPagination: true,
+      $select: 'id,displayName,description',
+      $orderby: 'displayName',
+      $top: 999,
+      $count: true,
+    },
+  },
+})
+
+// The deploy drawers offer the picker only when exactly one tenant is selected; group ids are
+// tenant-scoped, and with several tenants only names can span them.
+export const getSingleDeployTenant = (selectedTenants) =>
+  Array.isArray(selectedTenants) &&
+  selectedTenants.length === 1 &&
+  selectedTenants[0]?.value !== 'AllTenants'
+    ? selectedTenants[0].value
+    : undefined
+
+// Turn picked group options into the deploy payload. The body carries both the ids and the
+// legacy name fields: every backend hop derives AssignTo from customGroup and the resolvers
+// prefer the ids, so names stay for log text and as an exact-name fallback.
+export const applyPickedGroups = (formData) => {
+  const { groupTargets, excludeGroupTargets, ...data } = formData
+  const nameOf = (group) => group?.addedFields?.displayName ?? group?.label
+  const include = Array.isArray(groupTargets) ? groupTargets : []
+  const exclude = Array.isArray(excludeGroupTargets) ? excludeGroupTargets : []
+  if (include.length > 0) {
+    data.customGroup = include.map(nameOf).join(', ')
+    data.GroupIds = include.map((group) => group.value).filter(Boolean)
+  }
+  if (exclude.length > 0) {
+    data.excludeGroup = exclude.map(nameOf).join(', ')
+    data.ExcludeGroupIds = exclude.map((group) => group.value).filter(Boolean)
+  }
+  return data
+}
 
 /**
  * Get assignment actions for Intune policies
@@ -43,15 +101,27 @@ export const useCippIntunePolicyActions = (tenant, policyType, options = {}) => 
     templateData = null,
   } = options
 
-  const getAssignmentFields = () => [
+  // Assignment mode + optional device filter, shared by every assign action.
+  const getOptionsAndFilterFields = (modeHelperText) => [
+    {
+      type: 'heading',
+      label: 'Assignment options',
+    },
     {
       type: 'radio',
       name: 'assignmentMode',
       label: 'Assignment mode',
       options: assignmentModeOptions,
-      defaultValue: 'replace',
+      defaultValue: 'append',
+      // Re-validate the Custom Group picker (no-op for broad actions, which have no groupTargets).
+      validators: { deps: ['groupTargets'] },
       helperText:
+        modeHelperText ||
         'Replace will overwrite existing assignments. Append keeps current assignments and adds/overwrites only for the selected groups.',
+    },
+    {
+      type: 'heading',
+      label: 'Device filter (optional)',
     },
     {
       type: 'autoComplete',
@@ -73,12 +143,56 @@ export const useCippIntunePolicyActions = (tenant, policyType, options = {}) => 
       options: assignmentFilterTypeOptions,
       defaultValue: 'include',
       helperText: 'Choose whether to include or exclude devices matching the filter.',
+      condition: { field: 'assignmentFilter', compareType: 'hasValue', clearOnHide: false },
+    },
+  ]
+
+  // All Users / All Devices / Globally: fixed target, with an optional exclude-groups picker.
+  const getBroadAssignFields = () => [
+    {
+      type: 'heading',
+      label: 'Exclude groups (optional)',
+    },
+    getGroupPickerField(tenant, 'excludeGroupTargets', 'Exclude group(s)', false),
+    ...getOptionsAndFilterFields(),
+  ]
+
+  // Custom Group: one picker + a radio choosing whether those groups are included or excluded.
+  const getCustomGroupFields = () => [
+    {
+      type: 'heading',
+      label: 'Target groups',
     },
     {
-      type: 'textField',
-      name: 'excludeGroup',
-      label: 'Exclude Group Names separated by comma. Wildcards (*) are allowed',
+      ...getGroupPickerField(tenant, 'groupTargets', 'Group(s)', false),
+      helperText: 'Leave empty with Exclude + Replace to remove all exclusions (keeps includes).',
+      validators: {
+        // Required, except Exclude + Replace where an empty selection clears all exclusions.
+        validate: (value, formValues) => {
+          if (
+            formValues?.assignmentDirection === 'exclude' &&
+            (formValues?.assignmentMode || 'append') === 'replace'
+          ) {
+            return true
+          }
+          return (Array.isArray(value) && value.length > 0) || 'Please select at least one group'
+        },
+      },
     },
+    {
+      type: 'radio',
+      name: 'assignmentDirection',
+      label: 'Assignment direction',
+      options: assignmentDirectionOptions,
+      defaultValue: 'include',
+      // Re-validate the picker so the empty-allowed rule updates when direction changes.
+      validators: { deps: ['groupTargets'] },
+      helperText:
+        'Include assigns to these groups; Exclude excludes them. Replace updates only this direction and keeps the other (and All Users/All Devices) intact.',
+    },
+    ...getOptionsAndFilterFields(
+      'Replace updates only the selected direction and keeps the other direction plus All Users/All Devices. Append adds the selected groups to existing assignments.'
+    ),
   ]
 
   const getCustomDataFormatter = (assignTo) => (row, action, formData) => {
@@ -89,8 +203,9 @@ export const useCippIntunePolicyActions = (tenant, policyType, options = {}) => 
       type: item?.URLName || policyType,
       ...(platformType && { platformType }),
       AssignTo: assignTo,
-      assignmentMode: formData?.assignmentMode || 'replace',
-      excludeGroup: formData?.excludeGroup || null,
+      assignmentMode: formData?.assignmentMode || 'append',
+      ExcludeGroupIds: (formData?.excludeGroupTargets || []).map((g) => g.value).filter(Boolean),
+      ExcludeGroupNames: (formData?.excludeGroupTargets || []).map((g) => g.label).filter(Boolean),
       AssignmentFilterName: formData?.assignmentFilter?.value || null,
       AssignmentFilterType: formData?.assignmentFilter?.value
         ? formData?.assignmentFilterType || 'include'
@@ -101,15 +216,20 @@ export const useCippIntunePolicyActions = (tenant, policyType, options = {}) => 
   const getCustomDataFormatterForGroups = () => (row, action, formData) => {
     const rows = Array.isArray(row) ? row : [row]
     const selectedGroups = Array.isArray(formData?.groupTargets) ? formData.groupTargets : []
+    const isExclude = formData?.assignmentDirection === 'exclude'
+    const ids = selectedGroups.map((group) => group.value).filter(Boolean)
+    const names = selectedGroups.map((group) => group.label).filter(Boolean)
     return rows.map((item) => ({
       tenantFilter: tenant === 'AllTenants' && item?.Tenant ? item.Tenant : tenant,
       ID: item?.id,
       type: item?.URLName || policyType,
       ...(platformType && { platformType }),
-      GroupIds: selectedGroups.map((group) => group.value).filter(Boolean),
-      GroupNames: selectedGroups.map((group) => group.label).filter(Boolean),
-      assignmentMode: formData?.assignmentMode || 'replace',
-      excludeGroup: formData?.excludeGroup || null,
+      GroupIds: isExclude ? [] : ids,
+      GroupNames: isExclude ? [] : names,
+      ExcludeGroupIds: isExclude ? ids : [],
+      ExcludeGroupNames: isExclude ? names : [],
+      assignmentDirection: formData?.assignmentDirection || 'include',
+      assignmentMode: formData?.assignmentMode || 'append',
       AssignmentFilterName: formData?.assignmentFilter?.value || null,
       AssignmentFilterType: formData?.assignmentFilter?.value
         ? formData?.assignmentFilterType || 'include'
@@ -130,7 +250,7 @@ export const useCippIntunePolicyActions = (tenant, policyType, options = {}) => 
         URLName: policyType === 'URLName' ? 'URLName' : policyType,
       },
       confirmText: 'Are you sure you want to create a template based on this policy?',
-      icon: <Book />,
+      icon: <CippIcons.Book />,
       color: 'info',
       multiPost: false,
     })
@@ -143,7 +263,7 @@ export const useCippIntunePolicyActions = (tenant, policyType, options = {}) => 
       type: 'POST',
       url: '/api/EditIntunePolicy',
       multiPost: false,
-      icon: <PencilIcon />,
+      icon: <CippIcons.Edit />,
       color: 'info',
       data: {
         ID: 'id',
@@ -177,7 +297,7 @@ export const useCippIntunePolicyActions = (tenant, policyType, options = {}) => 
       type: 'POST',
       url: '/api/AddIntunePolicyClone',
       multiPost: false,
-      icon: <DocumentDuplicateIcon />,
+      icon: <CippIcons.DocumentDuplicateIcon />,
       color: 'info',
       data: templateData || {
         ID: 'id',
@@ -210,6 +330,7 @@ export const useCippIntunePolicyActions = (tenant, policyType, options = {}) => 
     label: 'Assign to All Users',
     type: 'POST',
     url: '/api/ExecAssignPolicy',
+    allowResubmit: true,
     data: {
       AssignTo: 'allLicensedUsers',
       ID: 'id',
@@ -217,10 +338,10 @@ export const useCippIntunePolicyActions = (tenant, policyType, options = {}) => 
       ...(platformType && { platformType: '!deviceAppManagement' }),
     },
     multiPost: false,
-    fields: getAssignmentFields(),
+    fields: getBroadAssignFields(),
     customDataformatter: getCustomDataFormatter('allLicensedUsers'),
     confirmText: 'Are you sure you want to assign "[displayName]" to all users?',
-    icon: <UserIcon />,
+    icon: <CippIcons.UserIcon />,
     color: 'info',
   })
 
@@ -229,6 +350,7 @@ export const useCippIntunePolicyActions = (tenant, policyType, options = {}) => 
     label: 'Assign to All Devices',
     type: 'POST',
     url: '/api/ExecAssignPolicy',
+    allowResubmit: true,
     data: {
       AssignTo: 'AllDevices',
       ID: 'id',
@@ -236,10 +358,10 @@ export const useCippIntunePolicyActions = (tenant, policyType, options = {}) => 
       ...(platformType && { platformType: '!deviceAppManagement' }),
     },
     multiPost: false,
-    fields: getAssignmentFields(),
+    fields: getBroadAssignFields(),
     customDataformatter: getCustomDataFormatter('AllDevices'),
     confirmText: 'Are you sure you want to assign "[displayName]" to all devices?',
-    icon: <LaptopChromebook />,
+    icon: <CippIcons.LaptopChromebook />,
     color: 'info',
   })
 
@@ -248,6 +370,7 @@ export const useCippIntunePolicyActions = (tenant, policyType, options = {}) => 
     label: 'Assign Globally (All Users / All Devices)',
     type: 'POST',
     url: '/api/ExecAssignPolicy',
+    allowResubmit: true,
     data: {
       AssignTo: 'AllDevicesAndUsers',
       ID: 'id',
@@ -255,10 +378,10 @@ export const useCippIntunePolicyActions = (tenant, policyType, options = {}) => 
       ...(platformType && { platformType: '!deviceAppManagement' }),
     },
     multiPost: false,
-    fields: getAssignmentFields(),
+    fields: getBroadAssignFields(),
     customDataformatter: getCustomDataFormatter('AllDevicesAndUsers'),
     confirmText: 'Are you sure you want to assign "[displayName]" to all users and devices?',
-    icon: <GlobeAltIcon />,
+    icon: <CippIcons.GlobeAltIcon />,
     color: 'info',
   })
 
@@ -267,41 +390,12 @@ export const useCippIntunePolicyActions = (tenant, policyType, options = {}) => 
     label: 'Assign to Custom Group',
     type: 'POST',
     url: '/api/ExecAssignPolicy',
-    icon: <UserGroupIcon />,
+    allowResubmit: true,
+    icon: <CippIcons.UserGroupIcon />,
     color: 'info',
     confirmText: 'Select the target groups for "[displayName]".',
     multiPost: false,
-    fields: [
-      {
-        type: 'autoComplete',
-        name: 'groupTargets',
-        label: 'Group(s)',
-        multiple: true,
-        creatable: false,
-        allowResubmit: true,
-        validators: { required: 'Please select at least one group' },
-        api: {
-          url: '/api/ListGraphRequest',
-          dataKey: 'Results',
-          queryKey: `ListPolicyAssignmentGroups-${tenant}`,
-          labelField: (group) =>
-            group.id ? `${group.displayName} (${group.id})` : group.displayName,
-          valueField: 'id',
-          addedField: {
-            description: 'description',
-          },
-          data: {
-            Endpoint: 'groups',
-            manualPagination: true,
-            $select: 'id,displayName,description',
-            $orderby: 'displayName',
-            $top: 999,
-            $count: true,
-          },
-        },
-      },
-      ...getAssignmentFields(),
-    ],
+    fields: getCustomGroupFields(),
     customDataformatter: getCustomDataFormatterForGroups(),
   })
 
@@ -316,7 +410,7 @@ export const useCippIntunePolicyActions = (tenant, policyType, options = {}) => 
         URLName: deleteUrlName === 'URLName' ? 'URLName' : deleteUrlName,
       },
       confirmText: 'Are you sure you want to delete this policy?',
-      icon: <TrashIcon />,
+      icon: <CippIcons.Delete />,
       color: 'danger',
     })
   }
